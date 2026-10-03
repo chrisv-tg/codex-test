@@ -10,6 +10,10 @@
 #   - USERSPACE HTTP proxy mode: `twingated --http-proxy 127.0.0.1:9999 --tun off`, key read
 #     from TWINGATE_SERVICE_KEY in the environment (no /etc/twingate, no setup as root).
 # APT install + TUN mode remain available on privileged hosts.
+# v3: $HOME can be READ-ONLY in Codex task sandboxes -> the install prefix is now the first
+#     writable candidate ($TWINGATE_PREFIX, $HOME/.local/share/twingate, /tmp/twingate-pkg-<uid>),
+#     `start` self-installs if the snapshot has no binaries, and the egress check no longer
+#     mis-reports failures ("000000").
 #
 # Docs:
 #   https://www.twingate.com/docs/linux-headless
@@ -40,7 +44,11 @@ set -euo pipefail
 
 TG_MODE="${TWINGATE_MODE:-auto}"
 TG_INSTALL_METHOD="${TWINGATE_INSTALL_METHOD:-auto}"
-TG_PREFIX="${TWINGATE_PREFIX:-${HOME:-/tmp}/.local/share/twingate}"
+PREFIX_CANDIDATES=()
+[[ -n "${TWINGATE_PREFIX:-}" ]] && PREFIX_CANDIDATES+=("${TWINGATE_PREFIX}")
+[[ -n "${HOME:-}" ]] && PREFIX_CANDIDATES+=("${HOME}/.local/share/twingate")
+PREFIX_CANDIDATES+=("/tmp/twingate-pkg-${EUID}")
+TG_PREFIX=""   # set by pick_prefix (install) or resolve_bins (start)
 TG_PROXY_LISTEN="${TWINGATE_PROXY_LISTEN:-127.0.0.1:9999}"
 TG_TIMEOUT="${TWINGATE_ONLINE_TIMEOUT:-90}"
 TG_TEST_URL="${TWINGATE_TEST_URL:-}"
@@ -87,11 +95,31 @@ RUNTIME_DIR="${STATE_DIR}/runtime"          # XDG_RUNTIME_DIR for the rootless d
 # Resolve binaries: rootless prefix first, then system PATH.
 TG_CLI=""; TG_DAEMON=""
 resolve_bins() {
-  TG_CLI=$(find "${TG_PREFIX}/root" -type f -name twingate  -perm -u+x 2>/dev/null | head -1 || true)
-  TG_DAEMON=$(find "${TG_PREFIX}/root" -type f -name twingated -perm -u+x 2>/dev/null | head -1 || true)
+  local p
+  TG_CLI=""; TG_DAEMON=""
+  for p in "${PREFIX_CANDIDATES[@]}"; do
+    TG_DAEMON=$(find "${p}/root" -type f -name twingated -perm -u+x 2>/dev/null | head -1 || true)
+    if [[ -n "${TG_DAEMON}" ]]; then
+      TG_PREFIX="${p}"
+      TG_CLI=$(find "${p}/root" -type f -name twingate -perm -u+x 2>/dev/null | head -1 || true)
+      break
+    fi
+  done
   [[ -z "${TG_CLI}"    ]] && TG_CLI=$(command -v twingate  2>/dev/null || true)
   [[ -z "${TG_DAEMON}" ]] && TG_DAEMON=$(command -v twingated 2>/dev/null || true)
   return 0
+}
+
+# First candidate we can actually write to (Codex task sandboxes may mount $HOME read-only).
+pick_prefix() {
+  local p
+  for p in "${PREFIX_CANDIDATES[@]}"; do
+    if mkdir -p "${p}" 2>/dev/null && touch "${p}/.w" 2>/dev/null; then
+      rm -f "${p}/.w"; TG_PREFIX="${p}"; return 0
+    fi
+    log "Prefix not writable, skipping: ${p}"
+  done
+  die "No writable install prefix. Set TWINGATE_PREFIX to a writable directory."
 }
 
 tg_cli() { XDG_RUNTIME_DIR="${RUNTIME_DIR}" "${TG_CLI}" "$@"; }
@@ -126,12 +154,14 @@ read_service_key() {
 
 egress_preflight() {
   local host="$1" via direct
-  via=$(curl -sS -o /dev/null --max-time 10 -w '%{http_code}' "https://${host}/" 2>/dev/null || echo 000)
-  direct=$(curl -sS -o /dev/null --max-time 10 --noproxy '*' -w '%{http_code}' "https://${host}/" 2>/dev/null || echo 000)
+  via=$(curl -s -o /dev/null --max-time 10 -w '%{http_code}' "https://${host}/" 2>/dev/null || true)
+  direct=$(curl -s -o /dev/null --max-time 10 --noproxy '*' -w '%{http_code}' "https://${host}/" 2>/dev/null || true)
+  via="${via:-000}"; direct="${direct:-000}"
   log "Egress to ${host}: via-env-proxy=${via} direct=${direct}"
   if [[ "${direct}" == "000" || "${direct}" == "403" ]]; then
     warn "Direct egress to ${host} looks blocked. twingated opens its own TLS/UDP sessions to the"
     warn "Controller and Relays; if only proxied HTTPS is allowed it may never come online."
+    warn "twingated will inherit HTTPS_PROXY=${HTTPS_PROXY:-${https_proxy:-<unset>}} — whether it honors it is the open question."
   fi
 }
 
@@ -146,6 +176,7 @@ deb_arch() {
 install_rootless() {
   local arch idx rec filename sha tmpdeb
   arch=$(deb_arch)
+  pick_prefix
   log "Rootless install (${arch}) into ${TG_PREFIX}"
   idx=$(curl -fsSL --retry 3 "${APT_REPO}Packages") \
     || die "Cannot fetch ${APT_REPO}Packages — add packages.twingate.com to Allowed domains."
@@ -256,7 +287,12 @@ stop_daemon() {
 
 cmd_start() {
   resolve_bins
-  [[ -n "${TG_DAEMON}" ]] || die "Twingate not installed in this snapshot. Run 'install' (Install script), then Republish."
+  if [[ -z "${TG_DAEMON}" ]]; then
+    log "Twingate binaries not in this snapshot; installing rootless now."
+    install_rootless
+    resolve_bins
+  fi
+  [[ -n "${TG_DAEMON}" ]] || die "Twingate install failed."
 
   local key network mode
   key=$(read_service_key)
@@ -322,7 +358,10 @@ cmd_stop() { resolve_bins; stop_daemon; log "Twingate stopped."; }
 cmd_doctor() {
   resolve_bins
   echo "uid=${EUID} privileged=${PRIVILEGED} CapBnd=$(cap_bnd_hex) tun_dev=$([[ -e /dev/net/tun ]] && echo yes || echo no) systemd=$(has_systemd && echo yes || echo no)"
-  echo "daemon=${TG_DAEMON:-missing} cli=${TG_CLI:-missing} prefix=${TG_PREFIX}"
+  echo "daemon=${TG_DAEMON:-missing} cli=${TG_CLI:-missing} prefix=${TG_PREFIX:-<none>}"
+  local p; for p in "${PREFIX_CANDIDATES[@]}"; do
+    echo "prefix candidate ${p}: $( (mkdir -p "${p}" && touch "${p}/.w" && rm -f "${p}/.w") 2>/dev/null && echo writable || echo read-only)"
+  done
   echo "key_in_env=$([[ -n "${TWINGATE_SERVICE_KEY:-}${TWINGATE_SERVICE_KEY_B64:-}" ]] && echo yes || echo no)"
   echo "HTTPS_PROXY=${HTTPS_PROXY:-${https_proxy:-<unset>}}"
   egress_preflight "packages.twingate.com"
