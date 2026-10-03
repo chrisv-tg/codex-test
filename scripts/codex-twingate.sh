@@ -16,8 +16,10 @@
 #   https://learn.chatgpt.com/codex/environments/cloud-environments
 #
 # Codex Cloud wiring:
-#   Install script : bash scripts/codex-twingate.sh install   (NO secrets; captured in the published snapshot)
-#   Start skill    : bash scripts/codex-twingate.sh start     (reads key from env at task start)
+#   Install script : bash "$(git rev-parse --show-toplevel)/scripts/codex-twingate.sh" install
+#                    (NO secrets; also copies itself to /usr/local/bin/codex-twingate so the
+#                     published snapshot has it on PATH regardless of repo path or branch)
+#   Start skill    : codex-twingate start     (reads key from env at task start)
 #
 # Secret input (set ONE of these as a Codex Cloud *Environment variable*, NOT a Network secret):
 #   TWINGATE_SERVICE_KEY      Minified JSON service key   (jq -c . service_key.json)
@@ -221,6 +223,10 @@ cmd_install() {
     -o Dir::Etc::sourceparts="-" -o APT::Get::List-Cleanup="0"
   ${SUDO} apt-get install -y -qq twingate >/dev/null
 
+  # Put this script on PATH so the Start skill never depends on cwd or the checked-out branch.
+  ${SUDO} install -m 755 "$(readlink -f "$0")" /usr/local/bin/codex-twingate
+  log "Installed helper: /usr/local/bin/codex-twingate"
+
   # Paranoia: make sure no key material is baked into the published snapshot.
   ${SUDO} rm -f /etc/twingate/service_key.json
 
@@ -236,7 +242,7 @@ cmd_install() {
 # start — runs in the Codex Cloud *Start skill* at the beginning of each task.
 # ---------------------------------------------------------------------------
 cmd_start() {
-  command -v twingate >/dev/null 2>&1 || die "Twingate is not installed. Run '$0 install' (Install script)."
+  command -v twingate >/dev/null 2>&1 || die "Twingate is not installed in this snapshot. Check the Install script ran, then Republish the environment."
 
   local key network mode
   key=$(read_service_key)
