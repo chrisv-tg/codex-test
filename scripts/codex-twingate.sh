@@ -14,6 +14,10 @@
 #     writable candidate ($TWINGATE_PREFIX, $HOME/.local/share/twingate, /tmp/twingate-pkg-<uid>),
 #     `start` self-installs if the snapshot has no binaries, and the egress check no longer
 #     mis-reports failures ("000000").
+# v4: The .deb assumes system libs the Codex image lacks (observed: libcryptsetup.so.12).
+#     Missing shared libs are now resolved rootless: a private apt state dir (no root) runs
+#     `apt-get update` + `apt-get download` from the image's own signed Ubuntu/Debian sources
+#     (hash-verified by apt), unpacks into the prefix, and LD_LIBRARY_PATH points at them.
 #
 # Docs:
 #   https://www.twingate.com/docs/linux-headless
@@ -36,6 +40,7 @@
 #   TWINGATE_ONLINE_TIMEOUT   Seconds to wait for online  (default: 90)
 #   TWINGATE_TEST_URL         Optional Resource URL to probe through the proxy after start
 #   TWINGATE_NO_PROXY_DOMAINS TUN mode only: private suffixes that must bypass the Codex proxy
+#   TWINGATE_EXTRA_PKGS       Space-separated apt packages to unpack if soname mapping misses one
 #
 # Usage: codex-twingate.sh {install|start|status|stop|doctor}
 #
@@ -107,6 +112,7 @@ resolve_bins() {
   done
   [[ -z "${TG_CLI}"    ]] && TG_CLI=$(command -v twingate  2>/dev/null || true)
   [[ -z "${TG_DAEMON}" ]] && TG_DAEMON=$(command -v twingated 2>/dev/null || true)
+  compute_libpath
   return 0
 }
 
@@ -122,7 +128,78 @@ pick_prefix() {
   die "No writable install prefix. Set TWINGATE_PREFIX to a writable directory."
 }
 
-tg_cli() { XDG_RUNTIME_DIR="${RUNTIME_DIR}" "${TG_CLI}" "$@"; }
+# Directories inside the prefix that hold shared libraries (bundled deps).
+TG_LIBPATH=""
+compute_libpath() {
+  TG_LIBPATH=""
+  [[ -n "${TG_PREFIX}" && -d "${TG_PREFIX}/root" ]] || return 0
+  TG_LIBPATH=$(find "${TG_PREFIX}/root" \( -name '*.so' -o -name '*.so.*' \) -printf '%h\n' 2>/dev/null | sort -u | paste -sd: -)
+}
+
+tg_cli() { LD_LIBRARY_PATH="${TG_LIBPATH}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" XDG_RUNTIME_DIR="${RUNTIME_DIR}" "${TG_CLI}" "$@"; }
+
+missing_libs() { # sonames still unresolved for the daemon + CLI
+  local b
+  for b in "${TG_DAEMON}" "${TG_CLI}"; do
+    [[ -n "${b}" && -x "${b}" ]] || continue
+    # `|| true`: ldd exits non-zero on scripts/static binaries; must not trip set -e/pipefail.
+    { LD_LIBRARY_PATH="${TG_LIBPATH}" ldd "${b}" 2>/dev/null || true; } | awk '/not found/ {print $1}'
+  done | sort -u
+}
+
+# Map a soname to likely Debian/Ubuntu package names (incl. 64-bit time_t "t64" renames).
+#   libcryptsetup.so.12 -> libcryptsetup12 | libcryptsetup-12 | libcryptsetup12t64 | ...
+soname_candidates() {
+  local base="${1%%.so.*}" ver="${1#*.so.}"
+  echo "${base}${ver} ${base}-${ver} ${base}${ver}t64 ${base}-${ver}t64"
+}
+
+# Fetch missing shared libraries without root, using the image's configured (signed) apt sources.
+resolve_missing_libs() {
+  command -v ldd >/dev/null 2>&1 || { warn "ldd unavailable; cannot check shared libraries."; return 0; }
+  compute_libpath
+  local missing; missing=$(missing_libs)
+  [[ -z "${missing}" ]] && return 0
+
+  command -v apt-get >/dev/null 2>&1 || die "Missing libs (${missing//$'\n'/ }) and no apt-get to fetch them."
+  local aptdir="${TG_PREFIX}/apt" debdir="${TG_PREFIX}/debs"
+  mkdir -p "${aptdir}/lists/partial" "${aptdir}/cache/archives/partial" "${debdir}"
+  local -a aptopts=(-o "Dir::State::Lists=${aptdir}/lists" -o "Dir::Cache=${aptdir}/cache"
+                    -o "Debug::NoLocking=1" -o "APT::Sandbox::User=$(id -un)")
+  log "Fetching apt indexes rootless (private state in ${aptdir})..."
+  apt-get "${aptopts[@]}" update -qq >/dev/null 2>&1 \
+    || warn "apt-get update reported errors (often an unrelated third-party source); continuing."
+
+  local round so cand got prev=""
+  for cand in ${TWINGATE_EXTRA_PKGS:-}; do
+    ( cd "${debdir}" && apt-get "${aptopts[@]}" download -qq "${cand}" >/dev/null 2>&1 ) \
+      && log "  extra package <- ${cand}" || warn "  extra package ${cand}: download failed"
+  done
+  for round in 1 2 3 4 5; do
+    missing=$(missing_libs)
+    [[ -z "${missing}" ]] && { log "All shared libraries resolved."; return 0; }
+    if [[ "${missing}" == "${prev}" && -z "$(ls -A "${debdir}" 2>/dev/null)" ]]; then break; fi
+    prev="${missing}"
+    log "Round ${round}: missing -> $(echo "${missing}" | paste -sd' ' -)"
+    for so in ${missing}; do
+      got=""
+      for cand in $(soname_candidates "${so}"); do
+        if apt-cache "${aptopts[@]}" show "${cand}" >/dev/null 2>&1; then
+          ( cd "${debdir}" && apt-get "${aptopts[@]}" download -qq "${cand}" >/dev/null 2>&1 ) && got="${cand}" && break
+        fi
+      done
+      if [[ -n "${got}" ]]; then log "  ${so} <- ${got}"; else warn "  ${so}: no package found"; fi
+    done
+    local d
+    for d in "${debdir}"/*.deb; do
+      [[ -e "${d}" ]] || continue
+      dpkg-deb -x "${d}" "${TG_PREFIX}/root" && rm -f "${d}"
+    done
+    compute_libpath
+  done
+  missing=$(missing_libs)
+  [[ -z "${missing}" ]] || die "Still missing shared libraries: $(echo "${missing}" | paste -sd' ' -). Set TWINGATE_EXTRA_PKGS to the providing package(s)."
+}
 
 # ---------------------------------------------------------------------------
 # Service key (never printed)
@@ -220,9 +297,7 @@ install_rootless() {
   [[ -n "${TG_DAEMON}" ]] || die "twingated not found in the package payload."
   log "Daemon: ${TG_DAEMON}"
   log "CLI:    ${TG_CLI:-<not found>}"
-  if command -v ldd >/dev/null 2>&1 && ldd "${TG_DAEMON}" 2>/dev/null | grep -q 'not found'; then
-    warn "Missing shared libraries for twingated:"; ldd "${TG_DAEMON}" | grep 'not found' >&2
-  fi
+  resolve_missing_libs
 }
 
 install_apt() {
@@ -293,6 +368,7 @@ cmd_start() {
     resolve_bins
   fi
   [[ -n "${TG_DAEMON}" ]] || die "Twingate install failed."
+  [[ -n "${TG_PREFIX}" ]] && resolve_missing_libs
 
   local key network mode
   key=$(read_service_key)
@@ -318,6 +394,7 @@ cmd_start() {
   else
     # Rootless userspace proxy: key via env (Twingate-Solutions Spacelift pattern), loopback-only bind.
     : > "${PROXY_LOG}"; chmod 600 "${PROXY_LOG}"
+    LD_LIBRARY_PATH="${TG_LIBPATH}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" \
     XDG_RUNTIME_DIR="${RUNTIME_DIR}" TWINGATE_SERVICE_KEY="${key}" \
       nohup "${TG_DAEMON}" --http-proxy "${TG_PROXY_LISTEN}" --tun off >>"${PROXY_LOG}" 2>&1 &
     echo $! > "${PID_FILE}"
@@ -362,6 +439,7 @@ cmd_doctor() {
   local p; for p in "${PREFIX_CANDIDATES[@]}"; do
     echo "prefix candidate ${p}: $( (mkdir -p "${p}" && touch "${p}/.w" && rm -f "${p}/.w") 2>/dev/null && echo writable || echo read-only)"
   done
+  [[ -n "${TG_DAEMON}" ]] && echo "missing_libs=$(missing_libs | paste -sd' ' -)"
   echo "key_in_env=$([[ -n "${TWINGATE_SERVICE_KEY:-}${TWINGATE_SERVICE_KEY_B64:-}" ]] && echo yes || echo no)"
   echo "HTTPS_PROXY=${HTTPS_PROXY:-${https_proxy:-<unset>}}"
   egress_preflight "packages.twingate.com"
